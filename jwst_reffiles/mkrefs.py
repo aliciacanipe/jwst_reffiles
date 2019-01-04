@@ -11,12 +11,16 @@ import sys
 import types
 
 import astropy.io.fits as fits
+from astropy.io import ascii
 import astropy
 import numpy as np
 import scipy
 
-from .utils.tools import astrotableclass,yamlcfgclass
-from .mkref import mkrefclass
+from jwst_reffiles.mkref import mkrefclass
+from jwst_reffiles.pipeline.calib_prep import CalibPrep
+from jwst_reffiles.pipeline import pipeline_steps
+from jwst_reffiles.utils.tools import astrotableclass, yamlcfgclass
+from jwst_reffiles.utils.tools import makepath,executecommand,append2file,rmfile
 
 # get the root dir of the code. This is needed only if the scripts are not installed as a module!
 #if 'JWST_MKREFS_SRCDIR' in os.environ:
@@ -28,7 +32,6 @@ from .mkref import mkrefclass
 rootdir = os.path.dirname(os.path.realpath(__file__))
 
 
-
 class cmdsclass(astrotableclass):
     def __init__(self):
         astrotableclass.__init__(self)
@@ -38,8 +41,19 @@ class mkrefsclass(astrotableclass):
     def __init__(self):
         astrotableclass.__init__(self)
 
-        #config file
+        # config file
         self.cfg = None
+
+        self.verbose = 0
+        self.debug = False
+        self.onlyshow = False
+
+        self.basedir = None
+        self.basename = None
+        self.outsubdir = None
+        self.ssbdir = None
+        self.runID = None
+        self.runlabel = None
 
         self.imtable = astrotableclass()
         self.images4ssb = astrotableclass()
@@ -53,24 +67,62 @@ class mkrefsclass(astrotableclass):
 
         self.cmdtable = cmdsclass()
 
-    def define_options(self, parser=None, usage=None):
+        self.allowed_reflabels = ['bpm', 'rdnoise_nircam', 'gain_armin']
+
+    def define_options(self, parser=None, usage=None, conflict_handler='resolve'):
         if parser is None:
-            parser = argparse.ArgumentParser(usage=usage, conflict_handler='resolve')
-        parser.add_argument("reftypes_and_imagelist", nargs='+', help=("list of ref types to be done"
-                                                                       "and image (or file patterns) lists"))
+            parser = argparse.ArgumentParser(usage=usage, conflict_handler=conflict_handler)
+        parser.add_argument("reflabels_and_imagelist", nargs='+', help=("list of ref types to be done"
+                                                                        "and image (or file patterns) lists"))
         parser.add_argument('-b', '--batchmode', help="run the commands in batch mode (default=%(default)s)",
                             action="store_true", default=False)
         parser.add_argument('--onlyshow', help="only show what would be done, but don't do it."
                                                "(default=%(default)s)", action="store_true", default=False)
 
-        mkref = mkrefclass()
-        parser = mkref.refoptions4mkrefs(parser=parser)
+        parser.add_argument('--outrootdir', default=None,
+                            help=('output root directory. outrootdir[/outsubdir][/runID]/reflabel/'
+                                  'reflabel[_outsubdir][_runID][.addsuffix].cmdID.reftype.fits '
+                                  '(default=%(default)s)'))
+        parser.add_argument('--outsubdir', default=None,
+                            help=('subdir added to the output root directory (and filename) '
+                                  '(default=%(default)s)'))
+        parser.add_argument('--addsuffix', default=None,
+                            help='suffix added to the output basename (default=%(default)s)')
+
+        parser.add_argument('--runID', default=None,
+                            help=('runID subdir added to output root directory (and filename) '
+                                  '(default=%(default)s)'))
+        parser.add_argument('--runIDNdigits', default=None,
+                            help='how many leading zeros in runID (default=%(default)s)')
+        parser.add_argument('-n', '--newrunID', help="get the next available runID",
+                            action="store_true", default=False)
+        parser.add_argument('--skip_runID_ssbdir', help="Don't use runID in the default ssb dir",
+                            action="store_true", default=False)
+
+        parser.add_argument('--ssbdir', default=None,
+                            help='Directory into which ssb files are stored (default=%(default)s)')
+
+        parser.add_argument('--force_redo_strun', help="Redo the ssb reduction with strun even if file already exists",
+                            action="store_true", default=False)
+        parser.add_argument('--maxNstrun', type=int, default=None,
+                            help='limit the number of strun commands to be run')
+
+
+        # Loop through all allowed reflabels, and add the options
+        for reflabel in self.allowed_reflabels:
+            print(reflabel)
+            mkrefpackage = __import__("mkref_%s" % reflabel)
+            mkref = mkrefpackage.mkrefclassX()
+            # Only load defaultoptions once...
+            if reflabel == self.allowed_reflabels[0]:
+                mkref.defaultoptions(parser)
+            # get the reflabel specific options
+            mkref.extraoptions(parser)
         return(parser)
 
     def loadcfgfiles(self, maincfgfile, extracfgfiles=None, params=None, params4all=None,
                      params4sections=None, requireParamExists=True):
         if self.cfg is None:
-
             self.cfg = yamlcfgclass()
         if self.cfg.loadcfgfiles(maincfgfile, extracfgfiles=extracfgfiles,
                                  params=params, params4all=params4all, params4sections=params4sections,
@@ -78,11 +130,205 @@ class mkrefsclass(astrotableclass):
             raise RuntimeError("Something went wrong when loading config files!")
         return(0)
 
+    def getbasedir(self, outrootdir=None, outsubdir=None, runlabel=None):
+        """ basedir based on options and cfg file: outrootdir[/outsubdir][/runID]"""
+        if outrootdir is None:
+            if self.cfg.params['output']['outrootdir'] == '':
+                raise RuntimeError("No output rootdir!")
+            else:
+                outrootdir = self.cfg.params['output']['outrootdir']
+
+        basedir = os.path.abspath(os.path.expandvars(outrootdir))
+        basename = ''
+
+        # outsubdir: test if outsubdir is passed or if it is specified in the config file ...
+        if outsubdir is None and self.cfg.params['output']['outsubdir'] != '':
+            outsubdir = self.cfg.params['output']['outsubdir']
+        # ... and if yes, add it
+        if outsubdir is not None:
+            basedir += '/%s' % outsubdir
+            if basename != '':
+                basename += '_'
+            basename += outsubdir
+
+        if runlabel is not None:
+            basedir += '/%s' % runlabel
+            if basename != '':
+                basename += '_'
+            basename += runlabel
+
+        if basename == '':
+            basename = 'B'
+
+        return(basedir, '%s/%s' % (basedir, basename), outsubdir)
+
+    def getbasename(self):
+        s = self.basedir+'/'
+        if self.outsubdir is not None:
+            s += '%s/' % self.outsubdir
+        if self.runID is not None:
+            s += '%s/' % self.outsubdir
+
+    def getssbdir(self, ssbdir, basedir, skip_runID_ssbdir=False):
+        """ get the ssbdir. It can be hardcoded to a directory with
+        --ssbdir or in the cfg file. If it is not specified, then
+        basedir/ssb is used"""
+        if ssbdir is not None and ssbdir != '':
+            return(ssbdir)
+        elif self.cfg.params['output']['ssbdir'] is not None and self.cfg.params['output']['ssbdir'] != '':
+            return(self.cfg.params['output']['ssbdir'])
+        else:
+            return('%s/ssb' % self.basedir)
+        return(None)
+
+    def get_highest_runID(self, basedir):
+        """ find all subdirs witn run\d+ within the passed basedir, and extract the highest runID"""
+        files = glob.glob('%s/run*' % basedir)
+        if len(files) == 0:
+            print('No runIDs yet!')
+            return(None)
+        runIDs = []
+        runIDpattern = re.compile('run(\d+)$')
+        for fname in files:
+            print(os.path.basename(fname))
+            m = runIDpattern.search(fname)
+            if m is not None:
+                runID = int(m.groups()[0])
+                runIDs.append(runID)
+        if len(runIDs) > 0:
+            runID = max(runIDs)
+        else:
+            runID = None
+        return(runID)
+
+    def set_runID(self, outrootdir=None, outsubdir=None, runID=None, runIDNdigits=None, newrunID=False):
+        """ set the runID depending on the options and config file """
+
+        # if no runID is specified with the options, then use the one from the cfg file
+        if runID is None:
+            runID = mkrefs.cfg.params['output']['runID']
+
+        if runID == '' or runID is None:
+            # If no runID specified, make sure it is set to None!
+            self.runID = None
+        elif isinstance(runID, int) or runID.isdigit():
+            # if runID is an integer, set it to it!
+            self.runID = int(runID)
+        else:
+            # if runID is AUTO, get the current highest runID, and increment if --new_runID (-n)
+            if runID.upper() == 'AUTO':
+                (basedir, basename, subdir) = self.getbasedir(outrootdir=outrootdir, outsubdir=outsubdir,
+                                                              runlabel=None)
+                self.runID = self.get_highest_runID(basedir)
+                if self.runID is None:
+                    self.runID = 0
+                else:
+                    if newrunID:
+                        self.runID += 1
+            else:
+                raise RuntimeError("Incorrect runID=%s requested!" % runID)
+
+        if self.runID is not None:
+            if runIDNdigits is None:
+                runIDNdigits = self.cfg.params['output']['runIDNdigits']
+            if runIDNdigits is None:
+                runIDNdigits = 1
+
+            b = 'run%0'+'%d' % runIDNdigits+'d'
+            self.runlabel = b % (self.runID)
+        else:
+            self.runlabel = ''
+
+        return(self.runID, self.runlabel)
+
+    #def getssbdir(self, ssbdir=None, **kwarg):
+    #    if ssbdir != None and ssbdir != '':
+    #        return(ssbdir)
+    #    ssbdir = '%s/ssb' % self.getbasedir(**kwarg)
+    #    return(ssbdir)
+
+    def set_dirs(self, outrootdir=None, outsubdir=None, runID=None, runIDNdigits=1, newrunID=False,
+                 ssbdir=None, skip_runID_ssbdir=False):
+        # get the runID
+        mkrefs.set_runID(outrootdir=outrootdir, outsubdir=outsubdir,
+                         runID=runID, runIDNdigits=runIDNdigits, newrunID=newrunID)
+
+        (self.basedir, self.basename, self.outsubdir) = self.getbasedir(outrootdir=outrootdir,
+                                                                        outsubdir=outsubdir,
+                                                                        runlabel=self.runlabel)
+
+        self.ssbdir = self.getssbdir(ssbdir, self.basedir, skip_runID_ssbdir=skip_runID_ssbdir)
+
+        # Create the directories if they don't already exist
+        if not self.onlyshow:
+            state_basedir = makepath(self.basedir)
+            state_ssbdir = makepath(self.ssbdir)
+
+        if self.verbose >= 3:
+            print('#### Directories:')
+            print('basedir:', self.basedir)
+            print('basename:', self.basename)
+            print('ssbdir:', self.ssbdir)
+            print('outsubdir:', self.outsubdir)
+            print('runID:', self.runID)
+            print('runlabel:', self.runlabel)
+
+        return(0)
+
+    def setoutbasename(self, reftype, imagelist, outbasename=None, outrootdir=None, outsubdir=None,
+                       addsuffix=None):
+        #if outbasename is not None:
+        #    self.outbasename = outbasename
+        #    return(outbasename)
+
+        if len(imagelist) > 1:
+            print('### more than 1 input file in setoutbasename not yet implemented!!!! exiting .... ###')
+            sys.exit(0)
+
+        # if outdir is passed or specified, use it, if not use the directiroy of the input filename
+        (imdir, imbasename) = os.path.split(os.path.abspath(imagelist[0]))
+        if outrootdir is None:
+            if self.cfg.params['output']['outrootdir'] == '':
+                raise RuntimeError("No output rootdir!")
+            else:
+                outrootdir = self.cfg.params['output']['outrootdir']
+
+        outbasename = '%s' % outrootdir
+
+        # outsubdir: test if outsubdir is passed or if it is specified in the config file ...
+        if outsubdir is None and self.cfg.params['output']['outsubdir'] != '':
+            outsubdir = self.cfg.params['output']['outsubdir']
+        # ... and if yes, add it
+        if outsubdir is not None:
+            outbasename += '/%s' % outsubdir
+
+        outbasename += '/'
+        if reftype is not None:
+            outbasename += '%s_' % (reftype)
+        outbasename += re.sub('\.fits$', '', imbasename)
+
+        # addsuffix: test if addsuffix is passed or if it is specified in the config file ...
+        if addsuffix is None and self.cfg.params['output']['addsuffix'] != '':
+            addsuffix = self.cfg.params['output']['addsuffix']
+        # ... and if yes, add it
+        if addsuffix is not None:
+            if not re.search('\.', addsuffix):
+                outbasename += '.'
+            outbasename += '%s' % addsuffix
+
+        if self.verbose > 1:
+            print('Output basenbame:', outbasename)
+
+        self.outbasename = outbasename
+
+        return(outbasename)
+
     def trim_imagelist(self, imagelist, basenamepattern=None):
         '''
         only keep fits file that match basenamepattern
         '''
-
+        if self.verbose > 1:
+            print("#### Trimming images...")
         # print imagelist
         if imagelist is None or len(imagelist) == 0:
             print('Nothing to do, no images!!!')
@@ -110,20 +356,19 @@ class mkrefsclass(astrotableclass):
 
         return(imagelist)
 
-    def parse_reftypes_images(self, reftypes_and_imagelist, basenamepattern=None):
-        reftypelist = []
+    def parse_reflabels_images(self, reflabels_and_imagelist, basenamepattern=None):
+        reflabellist = []
         imagelist = []
-        for s in reftypes_and_imagelist:
-            if s in self.cfg.params['reftypes']:
-                reftypelist.append(s)
+        for s in reflabels_and_imagelist:
+            if s in self.cfg.params['reflabels']:
+                reflabellist.append(s)
             else:
                 if not os.path.isfile(s):
                     raise RuntimeError("ERROR: file %s does not exist, thus not a viable input file" % s)
                 imagelist.append(os.path.abspath(s))
 
         imagelist = self.trim_imagelist(imagelist, basenamepattern)
-
-        return(reftypelist, imagelist)
+        return(reflabellist, imagelist)
 
     def getimtypes(self):
         if not ('imtype' in self.imtable.t.colnames):
@@ -139,15 +384,21 @@ class mkrefsclass(astrotableclass):
             elif flatpattern.search(shortfilename):
                 self.imtable.t['imtype'][i] = 'flat'
             else:
-                print('ERROR: image type of image %s is unknown!')
+                raise RuntimeError('ERROR: image type of image %s is unknown!' % shortfilename)
 
     def getimageinfo(self, imagelist, dateobsfitskey=None, timeobsfitskey=None, mjdobsfitskey=None):
+
+        if self.verbose > 1:
+            print("Getting image info")
 
         # self.imtable['fitsfile'].format('%s')
         self.imtable.t['fitsfile'] = imagelist
         self.imtable.t['imID'] = list(range(len(imagelist)))
         self.imtable.t['imtype'] = None
         self.imtable.t['skip'] = False
+
+        if self.verbose > 1:
+            print("Table created")
 
         requiredfitskeys = self.cfg.params['inputfiles']['requiredfitskeys']
         if requiredfitskeys is None:
@@ -167,7 +418,7 @@ class mkrefsclass(astrotableclass):
         self.imtable.fitsheader2table('fitsfile',
                                       requiredfitskeys=requiredfitskeys,
                                       optionalfitskey=self.cfg.params['inputfiles']['optionalfitskeys'],
-                                      raiseError=False, skipcolname='skip')
+                                      raiseError=True, skipcolname='skip')
         self.imtable.dateobs2mjd(dateobsfitskey, mjdcol, mjdobscol=mjdobsfitskey, timeobscol=timeobsfitskey)
 
         self.getimtypes()
@@ -176,14 +427,13 @@ class mkrefsclass(astrotableclass):
 
         #self.darks = self.imtable.t[np.where(self.imtable.t['imtype']=='dark')]
         #self.flats = self.imtable.t[np.where(self.imtable.t['imtype']=='flat')]
-
         return(0)
 
-    def organize_inputfiles(self, reftypes_and_imagelist):
-        # parse teh command line arguments for reftypes and images
-        (reftypelist, imagelist) = self.parse_reftypes_images(reftypes_and_imagelist,
-                                                              basenamepattern=self.cfg.params['inputfiles']['basenamepattern'])
-        self.reftypelist = reftypelist
+    def organize_inputfiles(self, reflabels_and_imagelist):
+        # parse teh command line arguments for reflabels and images
+        (reflabellist, imagelist) = self.parse_reflabels_images(reflabels_and_imagelist,
+                                                                basenamepattern=self.cfg.params['inputfiles']['basenamepattern'])
+        self.reflabellist = reflabellist
 
         # make the image table and populate it with info. Also get teh darks and flats table
         self.getimageinfo(imagelist,
@@ -195,19 +445,69 @@ class mkrefsclass(astrotableclass):
 
         if self.verbose:
             print('#################\n### %d images found!' % len(self.imtable.t))
-            print('### %d darks, %d flats' % (len(np.where(self.imtable.t['imtype'] == 'dark')[0]), len(np.where(self.imtable.t['imtype'] == 'flat')[0])))
+            print('### %d darks, %d flats' % (len(np.where(self.imtable.t['imtype'] == 'dark')[0]),
+                                              len(np.where(self.imtable.t['imtype'] == 'flat')[0])))
             print('### %d detectors:' % (len(self.detectors)), ", ".join(self.detectors))
-            if self.verbose>1:
+            if self.verbose > 1:
                 print(self.imtable.t)
+
+    def check_inputfiles(self):
+        print('basedir:', self.basedir)
+        print('basename:', self.basename)
+
+        # test if output dir already exists.
+        #if not os.path.isdir(self.basedir):
+        #    # if it doesn't exist: write the image list into it if !onlyshow!
+        #    if not self.onlyshow:
+        #        if self.verbose > 1:
+        #            print('Creating directory %s' % self.basedir)
+        #        os.makedirs(self.basedir)
+        #        if not os.path.isdir(self.basedir):
+        #            raise RuntimeError('Cannot create directory %s' % self.basedir)
+        #    else:
+        #        print('*** only showing: directory %s would be created here!' % self.basedir)
+
+        imtbl_filename = '%s.im.txt' % self.basename
+
+        # check: does the saved inputim file has the same input images
+        # than the current list? If yes, then all is good, if not
+        # throw an error!
+        if os.path.isfile(imtbl_filename):
+            imtable_before = astrotableclass()
+            imtable_before.load(imtbl_filename)
+
+            if (len(self.imtable.t['fitsfile']) != len(imtable_before.t['fitsfile'])):
+                raise RuntimeError(('length %d of new list of input images is different than the one from '
+                                    'the saved table (%d), cannot proceed! either get a new runID with -n, '
+                                    'or remove the files in %s' % (len(self.imtable.t['fitsfile']),
+                                                                   len(imtable_before.t['fitsfile']),
+                                                                   self.basedir)))
+
+            for i in range(len(self.imtable.t['fitsfile'])):
+                if self.imtable.t['fitsfile'][i] != imtable_before.t['fitsfile'][i]:
+                    raise RuntimeError(('input file %s in new list is different than previous input '
+                                        'file %s' % (self.imtable.t['fitsfile'][i],
+                                                     imtable_before.t['fitsfile'][i])))
+
+            if self.verbose:
+                print('new input list matches previous input list! Continuing...')
+
+        self.imtable.write(imtbl_filename, verbose=True, clobber=True)
+
+        # just some paranoia...
+        if not os.path.isfile(imtbl_filename):
+            raise RuntimeError('Could not write %s! permission issues?' % (imtbl_filename))
+
+        return(0)
 
     def get_optional_arguments(self, args, sysargv):
         fitspattern = re.compile('\.fits$')
 
         opt_arg_list = []
         for i in range(1, len(sysargv)):
-            if sysargv[i] in args.reftypes_and_imagelist:
-                if sysargv[i] in self.reftypelist:
-                    print('this is a reftype', sysargv[i])
+            if sysargv[i] in args.reflabels_and_imagelist:
+                if sysargv[i] in self.reflabellist:
+                    print('this is a reflabel', sysargv[i])
                 else:
                     # test if it is an image
                     if not fitspattern.search(sysargv[i]):
@@ -228,6 +528,7 @@ class mkrefsclass(astrotableclass):
         # indices for detector and not skipped
         dindex4detector = dindex[np.where(np.logical_and(self.imtable.t['DETECTOR'][dindex] == detector,
                                                          np.logical_not(self.imtable.t['skip'][dindex])))]
+
         if self.verbose > 2:
             print('Possible %d Darks for detector %s' % (len(dindex4detector), detector))
             print(self.imtable.t[dindex4detector])
@@ -270,7 +571,11 @@ class mkrefsclass(astrotableclass):
                 print('dMJD:', dMJD)
                 if dMJD > max_Delta_MJD:
                     if self.verbose > 2:
-                        print('Skipping imID=%d (MJD=%f) since imID=%d is not within timelimit (Delta MJD = %f>%f)!' % (self.imtable.t['imID'][dindex4detector[i]],self.imtable.t['MJD'][i],self.imtable.t['imID'][dindex4detector[i+1]],dMJD,max_Delta_MJD))
+                        print(('Skipping imID=%d (MJD=%f) since imID=%d is not within timelimit (Delta '
+                               'MJD = %f>%f)!' % (self.imtable.t['imID'][dindex4detector[i]],
+                                                  self.imtable.t['MJD'][i],
+                                                  self.imtable.t['imID'][dindex4detector[i+1]],
+                                                  dMJD, max_Delta_MJD)))
                     i += 1
                     continue
             if self.verbose > 1:
@@ -315,11 +620,15 @@ class mkrefsclass(astrotableclass):
                 if dMJD > max_Delta_MJD:
                     if self.verbose > 2:
                         print(('Skipping imID=%d (MJD=%f) since imID=%d is not within '
-                               'timelimit (Delta MJD = %f>%f)!') % (self.imtable.t['imID'][findex4detector[i]],self.imtable.t['MJD'][i],self.imtable.t['imID'][findex4detector[i+1]],dMJD,max_Delta_MJD))
+                               'timelimit (Delta MJD = %f>%f)!') % (self.imtable.t['imID'][findex4detector[i]],
+                                                                    self.imtable.t['MJD'][i],
+                                                                    self.imtable.t['imID'][findex4detector[i+1]],
+                                                                    dMJD, max_Delta_MJD))
                     i += 1
                     continue
             if self.verbose > 1:
-                print('Adding FF pair with imID=%d and %d' % (self.imtable.t['imID'][findex4detector[i]],self.imtable.t['imID'][findex4detector[i+1]]))
+                print('Adding FF pair with imID=%d and %d' % (self.imtable.t['imID'][findex4detector[i]],
+                                                              self.imtable.t['imID'][findex4detector[i+1]]))
             FF.t.add_row({'F1index': findex4detector[i], 'F2index': findex4detector[i+1],
                           'F1imID': self.imtable.t['imID'][findex4detector[i]],
                           'F2imID': self.imtable.t['imID'][findex4detector[i+1]]})
@@ -347,7 +656,7 @@ class mkrefsclass(astrotableclass):
         for f in range(len(FF.t)):
             if self.verbose > 2:
                 print('# Finding DD pair for FF pair with imID=%d and %d' % (FF.t['F1imID'][f], FF.t['F2imID'][f]))
-            if DDFF_max_Delta_MJD!=None:
+            if DDFF_max_Delta_MJD is not None:
                 FF_MJDmin = np.amin(np.array((self.imtable.t['MJD'][FF.t['F1index'][f]],
                                               self.imtable.t['MJD'][FF.t['F2index'][f]])))
                 FF_MJDmax = np.amax(np.array((self.imtable.t['MJD'][FF.t['F1index'][f]],
@@ -371,7 +680,9 @@ class mkrefsclass(astrotableclass):
                                         DD_MJDmin-FF_MJDmin])
                         max_dMJD = np.amax(dMJD)
                         if max_dMJD > DDFF_max_Delta_MJD:
-                            print('DD pair with imID=%d and %d cannot be used, dMJD=%f>%f' % (DD.t['D1imID'][d], DD.t['D2imID'][d], max_dMJD, DDFF_max_Delta_MJD))
+                            print('DD pair with imID=%d and %d cannot be used, dMJD=%f>%f' % (DD.t['D1imID'][d],
+                                                                                              DD.t['D2imID'][d],
+                                                                                              max_dMJD, DDFF_max_Delta_MJD))
                             continue
                     ddcountmin = ddcount[d]
                     d_best = d
@@ -381,7 +692,10 @@ class mkrefsclass(astrotableclass):
                 print(FF.t[f])
             else:
                 if self.verbose > 2:
-                    print('SUCCESS! DD pair with imID %d and %d found for FF pair with imID %d and %d' % (DD.t['D1imID'][d_best], DD.t['D2imID'][d_best], FF.t['F1imID'][f], FF.t['F2imID'][f]))
+                    print('SUCCESS! DD pair with imID %d and %d found for FF pair with imID %d and %d' % (DD.t['D1imID'][d_best],
+                                                                                                          DD.t['D2imID'][d_best],
+                                                                                                          FF.t['F1imID'][f],
+                                                                                                          FF.t['F2imID'][f]))
                 ddcount[d_best] += 1
                 DDFF.t.add_row({'D1index': DD.t['D1index'][d_best],
                                 'D2index': DD.t['D2index'][d_best],
@@ -395,9 +709,10 @@ class mkrefsclass(astrotableclass):
         print(DDFF.t)
         return(DDFF, ('D1', 'D2', 'F1', 'F2'))
 
-    def get_inputimage_sets(self, reftype, detector, DD_max_Delta_MJD=None, FF_max_Delta_MJD=None,
+    def get_inputimage_sets(self, reflabel, detector, DD_max_Delta_MJD=None, FF_max_Delta_MJD=None,
                             DDFF_max_Delta_MJD=None):
-        imtypes = self.cfg.params[reftype]['imtypes']
+        imtypes = self.cfg.params[reflabel]['imtypes']
+        print("imtypes is {}".format(imtypes))
         imagesets = []
         if imtypes == 'D':
             imagesets, imagelabels = self.getDlist(detector)
@@ -413,51 +728,125 @@ class mkrefsclass(astrotableclass):
             raise RuntimeError("ERROR: imtypes=%s not yet implemented!" % imtypes)
         return(imagesets, imagelabels)
 
-    def cmds4mkref(self, optionalargs):
+    def pick_strun_cmds_to_execute(self, force_redo_strun=False, maxNstrun = None, execute_strun_col='execute_strun'):
+        """ pick the strun commands to be executed! execute if
+        primary_strun=True, and both
+        file_exists,already_in_batch=False.  if force_redo_strun, then
+        execute even if file_exists, and throw error message if
+        already_in_batch """
+        execute_strun = np.full((len(self.ssbcmdtable.t)),False)
+        Nstrun=0
+        for i in range(len(self.ssbcmdtable.t)):
+            exeflag=self.ssbcmdtable.t['primary_strun'][i]
+
+            # Don't redo it if file already exists and if it is not force_redo_strun
+            if (not force_redo_strun) and self.ssbcmdtable.t['file_exists'][i]:
+                exeflag=False
+
+            if self.ssbcmdtable.t['already_in_batch'][i]:
+                exeflag=False
+                # force_redo_strun? Cannot do that, otherwise all hell would break loose with overwriting files etc
+                if force_redo_strun:
+                    raise RuntimeError("Cannot use --force_redo_strun when strun command %s of index %d is still running in batch mode!" % (self.ssbcmdtable.t['strun_command'][i],i))
+
+            if maxNstrun!=None and Nstrun>=maxNstrun:
+                if self.verbose>=3:
+                    print('Skipping executing strun command for index %d, since maxNstrun=%d' % (i,maxNstrun))
+                exeflag=False
+
+            if exeflag:
+                Nstrun+=1
+
+            execute_strun[i]=exeflag
+
+        self.ssbcmdtable.t[execute_strun_col]=execute_strun
+        return(0)
+
+    def check_if_primary_strun(self, primary_strun_col='primary_strun'):
+        """ check which entries are primary strun commands. """
+        primary_strun = np.full((len(self.ssbcmdtable.t)),True)
+        for i in range(len(self.ssbcmdtable.t)):
+            if self.ssbcmdtable.t['index_contained_within'][i][0]!=-1:
+                primary_strun[i]=False
+            if self.ssbcmdtable.t['repeat_of_index_number'][i][0]!=-1:
+                primary_strun[i]=False
+        self.ssbcmdtable.t[primary_strun_col]=primary_strun
+        return(0)
+
+    def check_if_inputfiles_exists(self, file_exists_col='file_exists'):
+        """ Check if input file exists, and fill the column file_exists_col with True or False """
+        file_exists = np.full((len(self.ssbcmdtable.t)),False)
+        for i in range(len(self.ssbcmdtable.t)):
+            if os.path.isfile(self.ssbcmdtable.t['output_name'][i]):
+                file_exists[i]=True
+        self.ssbcmdtable.t[file_exists_col]=file_exists
+        return(0)
+
+    def check_if_already_in_batch(self, already_in_batch_col='already_in_batch'):
+        """ check if the reduced input files are already running in batch (Condor), and set 'already_in_batch' to True or False """
+
+        print('\n*************************\n Check for Batch still needs to be implemented here!! \n *************************\n')
+
+        already_in_batch = np.full((len(self.ssbcmdtable.t)),False)
+        for i in range(len(self.ssbcmdtable.t)):
+            # ADD CHECK HERE!!!
+            print('Check for {}'.format(self.ssbcmdtable.t['strun_command'][i]))
+        self.ssbcmdtable.t[already_in_batch_col]=already_in_batch
+        return(0)
+
+    def mk_ssb_cmds(self,force_redo_strun=False,maxNstrun=None):
         '''
-        Construct the reftype commands, get the input files
+        Construct the reflabel commands, get the input files
         '''
         if self.verbose:
             print('\n##################################\n### Constructing commands\n##################################')
 
-        # this is just to get the correct dtype for the reftype  columns
-        dummyreftype = astrotableclass()
-        dummyreftype.t['reftype'] = self.reftypelist
-        dummyreftype.t['ssbsteps'] = [self.cfg.params[reftype]['ssbsteps'] for reftype in self.reftypelist]
+        # Expand ssbstep list if a shorthand is used
+        for reflabel in self.reflabellist:
+            step_name = self.cfg.params[reflabel]['ssbsteps'].strip()
+            if step_name[-1] == '-':
+                self.cfg.params[reflabel]['ssbsteps'] = pipeline_steps.step_minus(step_name, self.cfg.params['instrument'])
+            elif step_name[-1] == '+':
+                self.cfg.params[reflabel]['ssbsteps'] = pipeline_steps.step_plus(step_name, self.cfg.params['instrument'])
 
-        self.cmdtable = astrotableclass(names=('reftype', 'detector', 'cmdID', 'Nim'),
-                                        dtype=(dummyreftype.t['reftype'].dtype,
+        # this is just to get the correct dtype for the reflabel  columns
+        dummyreflabel = astrotableclass()
+        dummyreflabel.t['reflabel'] = self.reflabellist
+        dummyreflabel.t['ssbsteps'] = [self.cfg.params[reflabel]['ssbsteps'] for reflabel in self.reflabellist]
+
+        self.cmdtable = astrotableclass(names=('reflabel', 'detector', 'cmdID', 'Nim'),
+                                        dtype=(dummyreflabel.t['reflabel'].dtype,
                                                self.imtable.t['DETECTOR'].dtype, 'i8', 'i8'))
-        #self.cmdtable = astrotableclass(names=('reftype','detector','cmdID','Nim'))
+        #self.cmdtable = astrotableclass(names=('reflabel','detector','cmdID','Nim'))
         self.cmdtable.t['cmdID', 'Nim'].format = '%5d'
-        self.cmdtable.t['reftype', 'detector'].format = '%s'
-        self.inputimagestable = astrotableclass(names=('cmdID', 'reftype', 'imlabel', 'imtype', 'detector',
+        self.cmdtable.t['reflabel', 'detector'].format = '%s'
+        self.inputimagestable = astrotableclass(names=('cmdID', 'reflabel', 'imlabel', 'imtype', 'detector',
                                                        'ssbsteps', 'imindex', 'imID', 'MJD', 'fitsfile'),
-                                                dtype=('i8', dummyreftype.t['reftype'].dtype, 'S40',
+                                                dtype=('i8', dummyreflabel.t['reflabel'].dtype, 'S40',
                                                        self.imtable.t['imtype'].dtype,
                                                        self.imtable.t['DETECTOR'].dtype,
-                                                       dummyreftype.t['ssbsteps'].dtype,
+                                                       dummyreflabel.t['ssbsteps'].dtype,
                                                        'i8', 'i8', 'f8', self.imtable.t['fitsfile'].dtype))
         self.inputimagestable.t['cmdID', 'imindex', 'imID'].format = '%5d'
         self.inputimagestable.t['MJD'].format = '%.8f'
 
         cmdID = 0
-        for reftype in self.reftypelist:
+        for reflabel in self.reflabellist:
 
-            print('SSB steps for reftype %s: %s' % (reftype, self.cfg.params[reftype]['ssbsteps']))
+            print('SSB steps for reflabel %s: %s' % (reflabel, self.cfg.params[reflabel]['ssbsteps']))
             #continue
 
             counter = 0
             for detector in self.detectors:
                 if self.verbose:
-                    print('### Constructing %s commands for detector %s' % (reftype, detector))
-                inputimagesets, inputimagelabels = self.get_inputimage_sets(reftype, detector,
+                    print('\n#############################\n### Constructing %s commands for detector %s' % (reflabel, detector))
+                inputimagesets, inputimagelabels = self.get_inputimage_sets(reflabel, detector,
                                                                             DD_max_Delta_MJD=self.cfg.params['DD']['max_Delta_MJD'],
                                                                             FF_max_Delta_MJD=self.cfg.params['FF']['max_Delta_MJD'],
                                                                             DDFF_max_Delta_MJD=self.cfg.params['DDFF']['max_Delta_MJD'])
 
                 if self.verbose:
-                    print('### %d image sets for %s for detector %s' % (len(inputimagesets.t), reftype, detector))
+                    print('### %d image sets for %s for detector %s' % (len(inputimagesets.t), reflabel, detector))
                 if self.verbose > 1:
                     print(inputimagesets.t)
                 for i in range(len(inputimagesets.t)):
@@ -477,103 +866,202 @@ class mkrefsclass(astrotableclass):
                         if self.verbose > 3:
                             print(self.imtable.t[inputimagesets.t['%sindex' % inputimagelabel][i]])
 
-                        dict2add = {'cmdID': cmdID, 'imindex': imindex, 'reftype': reftype,
+                        dict2add = {'cmdID': cmdID, 'imindex': imindex, 'reflabel': reflabel,
                                     'detector': detector, 'imlabel': inputimagelabel,
-                                    'ssbsteps': self.cfg.params[reftype]['ssbsteps']}
+                                    'ssbsteps': self.cfg.params[reflabel]['ssbsteps']}
                         for key in ['fitsfile', 'imID', 'imtype', 'MJD']:
-                            dict2add[key]=self.imtable.t[key][imindex]
+                            dict2add[key] = self.imtable.t[key][imindex]
                         self.inputimagestable.t.add_row(dict2add)
 
-                    self.cmdtable.t.add_row({'reftype': reftype, 'detector': detector, 'cmdID': cmdID,
+                    self.cmdtable.t.add_row({'reflabel': reflabel, 'detector': detector, 'cmdID': cmdID,
                                              'Nim': len(inputimagelabels)})
                     cmdID += 1
-        print('\n### COMMANDS:')
-        print(self.cmdtable.t)
-        print('\n### INPUT FILES:')
-        print(self.inputimagestable.t)
 
-        print('BRYAN: here we call your script to get the outoput filenames and the commands to run SSB!')
-        print('input is the self.inputimagestable')
-        print('What we need is: ssb-reduced input filename, a flag if this ssb-reduced input file already exists, and the commands to reduce the inputfilename to the ssb stage it needs to be run')
-        print('ssbsteps: here we have to figure out what nomenclature to use to define which ssb steps to run. As examples, I just came up with names, but we probably should use the SSB step names.')
-
-        sys.exit(0)
-
-    def cmds4mkrefold(self, optionalargs):
-
-        if self.verbose:
-            print('##################################\n### Constructing commands')
-
-        for reftype in self.reftypelist:
-
-            if self.verbose:
-                print('### Constructing %s commands' % reftype)
-            counter = 0
-            for detector in self.detectors:
-                inputimagesets = self.get_inputimage_sets(reftype, detector,
-                                                          DD_max_Delta_MJD=self.cfg.params['DD']['max_Delta_MJD'],
-                                                          FF_max_Delta_MJD=self.cfg.params['FF']['max_Delta_MJD'],
-                                                          DDFF_max_Delta_MJD=self.cfg.params['DDFF']['max_Delta_MJD'])
-                continue
-                for inputimageset in inputimagesets:
-                    cmdargs = '%s' % reftype
-
-                    if type(inputimageset) is list:
-                        cmdargs += ' %s' % ' '.join(inputimageset)
-                    else:
-                        cmdargs += ' %s' % inputimageset
-
-                    cmdargs += ' '
-                    cmdargs += ' '.join(optionalargs)
-
-                    mkref = mkrefclass()
-                    mkref.mkref(cmdargs.split(), onlyinit=True)
-
-                    if len(self.cmdtable.t) == 0:
-                        self.cmdtable.t['reftype'] = np.array([reftype])
-                        self.cmdtable.t['detector'] = detector
-                        self.cmdtable.t['outbasename'] = None
-                        self.cmdtable.t['cmdargs'] = cmdargs
-                    else:
-                        self.cmdtable.t.add_row({'reftype': reftype, 'detector': detector,
-                                                 'outbasename': None, 'cmdargs': cmdargs})
-                    counter += 1
-                print('%d %s commands for detector %s' % (counter, reftype, detector))
-
-        print('### in total, %d commands' % (len(self.cmdtable.t)))
         if self.verbose > 1:
-            print('Commands constructed:')
+            print('\n### COMMANDS:')
             print(self.cmdtable.t)
+            print('\n### INPUT FILES:')
+            print(self.inputimagestable.t)
 
-        sys.exit(0)
+        print('**** ADD: additional check if input images are the same!! ****')
+        self.inputimagestable.write('%s.inputim.txt' % self.basename, verbose=True, clobber=True)
+
+        mmm = CalibPrep(self.cfg.params['instrument'])
+        mmm.inputs = self.inputimagestable.t
+
+        print('Bryan: we need to look for ssb files in the ssb output dir, and then also in the optional pipeline_prod_search_dir. Let me know how I should pass this inof!')
+        mmm.search_dir = self.ssbdir
+        # add additional search dirs!
+        if self.cfg.params['output']['pipeline_prod_search_dir'] is not None:
+            mmm.search_dir += ',%s' % (self.cfg.params['output']['pipeline_prod_search_dir'])
+
+        mmm.output_dir = self.ssbdir
+        mmm.prepare()
+        print('Table column names:')
+        print(mmm.proc_table.colnames)
+
+        #print('BACK IN MKREFS:')
+        print(mmm.proc_table['index', 'cmdID', 'reflabel', 'steps_to_run', 'repeat_of_index_number', 'index_contained_within'])
+        #print(mmm.proc_table['strun_command'][-1])
+        sys.exit()
+
+        self.ssbcmdtable = astrotableclass()
+        self.ssbcmdtable.t = mmm.proc_table
+
+        # check which entries are primary strun commands. Only primary
+        # strun commands need to be executed, secondary strun commands
+        # are already covered by primary strun commands
+        self.check_if_primary_strun()
+
+        # check if the reduced input files exist or not, and fill
+        # 'file_exists' column with True or False
+        self.check_if_inputfiles_exists()
+
+        # check if the reduced input files are already running in
+        # batch (Condor), and set 'already_in_batch' to True or False
+        self.check_if_already_in_batch()
+
+        # pick the strun commands that need to be executed
+        self.pick_strun_cmds_to_execute(force_redo_strun = force_redo_strun, maxNstrun = maxNstrun)
+
+        # set strun_executed to None
+        self.ssbcmdtable.t['strun_executed'] = np.full((len(self.ssbcmdtable.t)),None)
+
+        print('VVVV',self.ssbcmdtable.t.colnames)
+        self.ssbcmdtable.write('%s.ssbcmds.txt' % self.basename,verbose=True,clobber=True,exclude_names=['repeat_of_index_number', 'index_contained_within'])
+
+        self.cmdtable.write('%s.refcmds.txt' % self.basename,verbose=True,clobber=True)
+
+        if self.verbose>1:
+            print(self.ssbcmdtable.t['index','real_input_file','ssbsteps','repeat_of_index_number', 'index_contained_within','primary_strun','file_exists','already_in_batch','execute_strun','strun_executed'])
+        
+        #print('strun commands:')
+        #print(mmm.strun)
+
+        return(0)
+
+    def getlogfilenames(self,filename):
+        (basename,suffix) = os.path.splitext(filename)
+        print (basename,suffix)
+        errorlog = '{}.err.txt'.format(basename)
+        outlog = '{}.log.txt'.format(basename)
+        if suffix != '.fits':
+            print('WARNING: It seems like the filename {} is not a fits file.'.format(filename))
+        return(outlog,errorlog)
+
+    def run_ssb_cmds(self,batchmode=False,ssblogFlag=False,ssberrorlogFlag=True):
+        if self.onlyshow:
+            if self.verbose: print('\n*** ONLYSHOW: skipping running the strun commands!\n')
+            return(0)
+
+        # cleaning up old output files:
+        for i in range(len(self.ssbcmdtable.t)):
+            if self.ssbcmdtable.t['execute_strun'][i]:
+                outfile = self.ssbcmdtable.t['output_name'][i]
+                (logfilename,errlogfilename) = self.getlogfilenames(outfile)
+                rmfile(outfile)
+                rmfile(logfilename)
+                # Don't clean up errlogfilename, we want to keep track of old errors...
+
+        indeces2run = np.where(self.ssbcmdtable.t['execute_strun'])
+
+        if batchmode:
+            print("### run strun commands in batch mode: NOT YET IMPLEMENTED!!!")
+
+            # submit the batch here, return errorflag in case there is an issue submitting the batch
+            errorflag = 0
+            strun_list = self.ssbcmdtable.t['strun_command'][indeces2run]
+
+            # This is the list to be submitted to the batch
+            print(strun_list)
+
+            # mark the entries that are submitted to the batch
+            if not errorflag:
+                self.ssbcmdtable.t['execute_strun'][indeces2run]='batch'
+
+        else:
+            t4strun = self.ssbcmdtable.t[indeces2run]
+            print(t4strun['index','execute_strun'])
+            for i in range(len(t4strun)):
+                strun_cmd = t4strun['strun_command'][i]
+                outfile = t4strun['output_name'][i]
+
+                # decide if logfiles, depending on config filea
+                (logfilename,errlogfilename) = self.getlogfilenames(outfile)
+                if not self.cfg.params['output']['ssblogFlag']: logfilename=None
+                if not self.cfg.params['output']['ssberrorlogFlag']: errlogfilename=None
+
+                print('### Executing strun command for index %d: %s' % (indeces2run[0][i],strun_cmd))
+                (errorflag) = executecommand(strun_cmd, '', cmdlog=logfilename, errorlog=errlogfilename)
+
+                # extra error checking
+                if not os.path.isfile(outfile):
+                    print('ERROR: file {} did not get created with strun command!'.format(outfile))
+                    errorflag|=2
+
+                # fill ssbtable with results.
+                if errorflag:
+                    self.ssbcmdtable.t['strun_executed'][indeces2run[0][i]]='ERROR{}_serial'.format(errorflag)
+                else:
+                    self.ssbcmdtable.t['strun_executed'][indeces2run[0][i]]='serial'
+
+        if self.verbose>1:
+            print(self.ssbcmdtable.t['index','real_input_file','repeat_of_index_number', 'index_contained_within','primary_strun','file_exists','already_in_batch','execute_strun','strun_executed'])
+
+        return(0)
+
+    def run_ref_cmds(self,batchmode=False):
+        print("### run ref commands: NOT YET IMPLEMENTED!!!")
+        return(0)
 
     def submitbatch(self):
         print("### submitbatch: NOT YET IMPLEMENTED!!!")
+        sys.exit(0)
 
-    def mkrefloop(self):
+    def mk_ref_cmds(self):
         for i in range(len(self.cmdtable.t)):
 
-            print('### running mkref.py %s' % self.cmdtable.t['cmdargs'][i])
-            mkref = mkrefclass()
-
-            mkref.mkref(self.cmdtable.t['cmdargs'][i].split())
+            print('### cmd ID %d: building cmd for %s' % (self.cmdtable.t['cmdID'][i],
+                                                          self.cmdtable.t['reflabel'][i]))
+            # (1) get teh input images from self.inputimagestable
+            # (2) parse through the options
 
     def combinerefs(self):
         print("### combinerefs: NOT YET IMPLEMENTED!!!")
+        sys.exit(0)
 
     def overview(self):
         print("### overview: NOT YET IMPLEMENTED!!!")
+        sys.exit(0)
 
 
 if __name__ == '__main__':
+
+    #cmd = 'echop hello1;echo GGGGGGG;echo SUCCESS'
+    #outputfile = '/Users/arest/nircam/jwst_reffiles/jwst_reffiles/delmeout.txt'
+    #errfile='/Users/arest/nircam/jwst_reffiles/jwst_reffiles/delmeerr.txt'
+    #(errorflag,stdoutlist,stderrlist) = executecommand(cmd,'SUCCESS', cmdlog=outputfile, errorlog=errfile, cmdlog_access_mode='a', verbose=2, cmdlog_save_as_chunk_flag = True,return_output=True)
+    #print('VVV',errorflag)
+    #print('BBB',stdoutlist)
+    #print('NNN',stderrlist)
+    #sys.exit(0)
 
     mkrefs = mkrefsclass()
     parser = mkrefs.define_options()
     args = parser.parse_args()
 
-    # set verbose level
+    print("Input files:")
+    print(args.reflabels_and_imagelist)
+
+    #print(args)
+    #for b in vars(args):
+    #    print(b,vars(args)[b])
+    #sys.exit()
+
+    # set verbose, debug, and onlyshow level
     mkrefs.verbose = args.verbose
     mkrefs.debug = args.debug
+    mkrefs.onlyshow = args.onlyshow
 
     # Load config files
     mkrefs.loadcfgfiles(args.cfgfile,
@@ -582,20 +1070,33 @@ if __name__ == '__main__':
                         params4all=args.pall,
                         params4sections=args.pp)
 
-    print(mkrefs.cfg.params)
-    mkrefs.organize_inputfiles(args.reftypes_and_imagelist)
+    # set the basedir, basename, ssbdir, outsubdir, runID, runlabel
+    mkrefs.set_dirs(outrootdir=args.outrootdir, outsubdir=args.outsubdir,
+                    runID=args.runID, runIDNdigits=args.runIDNdigits, newrunID=args.newrunID,
+                    ssbdir=args.ssbdir, skip_runID_ssbdir=args.skip_runID_ssbdir)
 
-    optionalargs = mkrefs.get_optional_arguments(args, sys.argv)
+    # get the inputfile list and reflabel list. For input files, get into!
+    mkrefs.organize_inputfiles(args.reflabels_and_imagelist)
 
-    mkrefs.cmds4mkref(optionalargs)
+    # check if current input files are consistent with previous ionput files of same output directory!
+    mkrefs.check_inputfiles()
+    #sys.exit(0)
 
-    if args.batchmode:
-        mkrefs.submitbatch()
-    else:
-        mkrefs.mkrefloop()
+    # create the ssb commands
+    mkrefs.mk_ssb_cmds(force_redo_strun=args.force_redo_strun, maxNstrun=args.maxNstrun)
+
+    sys.exit(0)
+    
+    # run the ssb commands
+    mkrefs.run_ssb_cmds(batchmode=args.batchmode,)
+
+    # create the reference file commands
+    mkrefs.mk_ref_cmds()
+
+    # run the reference file  commands
+    mkrefs.run_ref_cmds(batchmode=args.batchmode)
 
     mkrefs.combinerefs()
 
     mkrefs.overview()
 
-    print('Hello3!')
